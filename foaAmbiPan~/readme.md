@@ -1,0 +1,3 @@
+I realized that my naming is really dumb because foa already specifies ambisonics...
+
+It should be called foaPan~. 
