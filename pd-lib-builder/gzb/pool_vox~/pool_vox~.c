@@ -15,8 +15,8 @@
  arg1: hue, used to determine frequency of oscillator [square wave]
  arg2: saturation, used to determine fc of lp filter (one-pole)
  arg3: value, used to determine volume of oscillator
- the value will be 0 when the image is black, we will invert instead
- abs(1-val) will give us sound only when there is color
+ the value will be 0 when the image is black, we will do 1 minus value instead
+    this will give us sound only when there is color (white = no sound)
  arg4: azimuth, will determine the position of the voice in 3OA (horizontal)
  arg5: elevation, will determine the position of the voice in 3OA (vertical)
  
@@ -101,8 +101,8 @@ static t_int *pool_vox_perform(t_int *w)
     //  t_floats are temporarily used to store sample values for outputs
     t_pool_vox *x = (t_pool_vox *)(w[1]); //self reference
     t_float *freq = (t_float *)(w[2]); //first inlet (hue)  [float pointer]
-    t_float *sat = (t_float *)(w[3]); //first inlet (hue)   [float pointer]
-    t_float *val = (t_float *)(w[4]); //first inlet (hue)   [float pointer]
+    //t_float *sat = (t_float *)(w[3]); //first inlet (hue)   [float pointer]
+    //t_float *val = (t_float *)(w[4]); //first inlet (hue)   [float pointer]
     
     //sixteen ambisonic channels
     t_float *out1 = (t_float *)(w[3]); t_float *out2 = (t_float *)(w[4]);
@@ -117,8 +117,8 @@ static t_int *pool_vox_perform(t_int *w)
     int n = (int)(w[19]); //block size
     
     //might not need sat and val in main struct after all
-    //t_sample s_sat = x->sat;
-    //t_sample s_val = x->value;
+    t_sample s_sat = x->sat;
+    t_sample s_value = x->value;
     
     // i like counting from zero
     int blocksize = n;
@@ -161,8 +161,8 @@ static t_int *pool_vox_perform(t_int *w)
         //after you get the sample from the wavetable, interpolate.
         //  it wasn't working, just had to restart Pd to update external. :)
         samp = quad_interpolate(x);
-        //multiple samp by inverse of "value" from GEM.
-        //samp = samp*(1.0f-*val);
+        //multiple samp by 1 minus "value" from GEM.
+        samp = samp*(1.0f-s_value);
 
         //still need to implement the filter w/ cutoff = sat.
         
@@ -295,7 +295,7 @@ static void *pool_vox_new(t_floatarg f, t_floatarg g)
         //16 harmonics.
 //        for(j = 0; j < 15; j++)
 //            {
-                //*(x->wavetable+i) = 1.0f/(1 + j*2.0f) * sinf(twopi * (float)i/size);
+            //*(x->wavetable+i) = 1.0f/(1 + j*2.0f) * sinf(twopi * (float)i/size);
                 *(x->wavetable+i)  = 1.0f/3.0f * sinf(twopi * 1.0f *(float)i/size);
                 *(x->wavetable+i) += 1.0f/3.0f * sinf(twopi * 3.0f *(float)i/size);
                 *(x->wavetable+i) += 1.0f/5.0f * sinf(twopi * 5.0f *(float)i/size);
