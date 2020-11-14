@@ -41,6 +41,13 @@ typedef struct _pool_vox
     t_float azi;        // azimuth of this voice
     t_float elev;       // elevation of this voice
     
+    //stuff for filter, controlled by saturation from GEM
+    /*---------------------------------------------------*/
+    t_float cutoff; //filter cutoff modulated by sat
+    t_float filt_q; //filter quality or q
+    t_float v0, v1, temp; //hold sample values for filter.
+    /*---------------------------------------------------*/
+    
     //inlet one is for the signal (hue: frequency of square wave)
     t_inlet *x_in2;//inlet 2 (for messages - saturation: fc)
     t_inlet *x_in3;//inlet 3 (for messages - value: volume of voice)
@@ -60,11 +67,13 @@ typedef struct _pool_vox
 } t_pool_vox;
 
 // some nice little interpolation routines
+// no interp [1]
 static inline float no_interpolate(t_pool_vox *x)
 {
     int x_1 = x->phase * WAVETABLESIZE;
     return(x->wavetable[x_1 % WAVETABLESIZE]);
 }
+//linear interpolation [2]
 static inline float lin_interpolate(t_pool_vox *x)
 {
     int x_1 = x->phase * WAVETABLESIZE;
@@ -72,8 +81,7 @@ static inline float lin_interpolate(t_pool_vox *x)
     float y_2 = x->wavetable[(x_1 + 1) % WAVETABLESIZE];
     return (y_2 - y_1) * ((x->phase * WAVETABLESIZE) - x_1) + y_1;
 }
-
-//using quad
+//using quad interp (hermitian) [3]
 static inline float quad_interpolate(t_pool_vox *x)
 {
     int truncphase = (int) (x->phase * WAVETABLESIZE);
@@ -83,10 +91,27 @@ static inline float quad_interpolate(t_pool_vox *x)
     float inp1 = x->wavetable[(truncphase + 1) % WAVETABLESIZE];
     float inp2 = x->wavetable[(truncphase + 2) % WAVETABLESIZE];
     
-    return in + 0.5 * fr * (inp1 - inm1 +
-                            fr * (4.0 * inp1 + 2.0 * inm1 - 5.0 * in - inp2 +
-                                  fr * (3.0 * (in - inp1) - inm1 + inp2)));
+    return in + 0.5 * fr *
+    (inp1 - inm1 + fr *
+        (4.0 * inp1 + 2.0 * inm1 - 5.0 * in - inp2 + fr *
+            (3.0 *
+                (in - inp1)
+                    - inm1 + inp2)
+                                    )
+                                        );
 }
+
+//static inline float two_pole_lp(t_pool_vox *x)
+//{
+//
+//    int truncphase = (int) (x->phase * WAVETABLESIZE);
+//    float fr = (x->phase * WAVETABLESIZE) - ((float) truncphase);
+////    float inm1 = x->wavetable[(truncphase - 1) % WAVETABLESIZE];
+//    float in   = x->wavetable[(truncphase + 0) % WAVETABLESIZE];
+////    float inp1 = x->wavetable[(truncphase + 1) % WAVETABLESIZE];
+////    float inp2 = x->wavetable[(truncphase + 2) % WAVETABLESIZE];
+//    //return = v1;
+//}
 
 /* this is the actual performance routine which acts on the samples.
  It's called with a single pointer "w" which is our location in the
@@ -101,8 +126,6 @@ static t_int *pool_vox_perform(t_int *w)
     //  t_floats are temporarily used to store sample values for outputs
     t_pool_vox *x = (t_pool_vox *)(w[1]); //self reference
     t_float *freq = (t_float *)(w[2]); //first inlet (hue)  [float pointer]
-    //t_float *sat = (t_float *)(w[3]); //first inlet (hue)   [float pointer]
-    //t_float *val = (t_float *)(w[4]); //first inlet (hue)   [float pointer]
     
     //sixteen ambisonic channels
     t_float *out1 = (t_float *)(w[3]); t_float *out2 = (t_float *)(w[4]);
@@ -116,18 +139,23 @@ static t_int *pool_vox_perform(t_int *w)
     
     int n = (int)(w[19]); //block size
     
-    //might not need sat and val in main struct after all
-    t_sample s_sat = x->sat;
-    t_sample s_value = x->value;
+    //get saturation ad value from main struct
+    t_sample s_sat = x->sat;        //used for cutoff of 2-pole filt.
+    t_sample s_value = x->value;    //1-value = amplitude of voice
     
     // i like counting from zero
     int blocksize = n;
-    int i, sample = 0;
+    int i, sample = 0;      //sample here is used to index, not store amplitudes
     float phaseincrement;
     float findex;
     float wphase;
     int	iindex;
-    float samp; //samp is the actual value
+    float samp;             //samp is the actual value
+    float f_res;            //resonance of 2-pole filter
+    float f_cutoff;         //cutoff storage
+    
+    //resonance fixed to 0.0625, filt_q set to 16
+    f_res = 1.0f/x->filt_q;
     
     while (n--)
     {
@@ -161,10 +189,36 @@ static t_int *pool_vox_perform(t_int *w)
         //after you get the sample from the wavetable, interpolate.
         //  it wasn't working, just had to restart Pd to update external. :)
         samp = quad_interpolate(x);
-        //multiple samp by 1 minus "value" from GEM.
-        samp = samp*(1.0f-s_value);
+        
+        //multiply samp by 1 minus "value" from GEM [HSV].
+        samp = samp * (1.0f - s_value);
 
-        //still need to implement the filter w/ cutoff = sat.
+        //filter w/ cutoff based on saturation from GEM.
+        // range 0-1 from saturation multiplied by 256
+        
+        //different tests. checking out what sounds good.
+        //x->cutoff = 2.0f * sinf((float)M_PI * (s_sat * (x->samplerate / 4.0f)) / x->samplerate);
+        //x->cutoff = 2.0f * sinf((float)M_PI * (s_sat * (x->samplerate/16.0f)) / x->samplerate);
+        
+        //256 = 16 x 16, arbitrary [settled on this]
+        //to-do: nicer sounding filter
+        x->cutoff = 2.0f * sinf((float)M_PI * (s_sat * (256.0f)) / x->samplerate);
+        
+        //mtof(64), 16X4
+        //x->cutoff = 2.0f * sinf((float)M_PI * (s_sat * (329.628f)) / x->samplerate);
+
+        
+        //www.musicdsp.org/en/latest/Filters/185-1-rc-and-c-filter.html
+        //implementing the filter
+        x->v0 = (1.0f - f_res * x->cutoff) * x->v0 -
+                x->cutoff * x->v1 +
+                x->cutoff * samp;
+        
+        x->v1 = (1.0f - f_res * x->cutoff) * x->v1 +
+                x->cutoff * x->v0;
+        
+        samp = x->v1;
+        //end of filter implementation (to-do: x->temp not used)
         
         //then apply coeffs based on SN3D calculations
         *(out1+sample) = samp * x->W;
@@ -280,9 +334,20 @@ static void *pool_vox_new(t_floatarg f, t_floatarg g)
     // initialize variables to 0.0f [except azi and elev.]
     x->x_f = 0.0f;
     x->phase = 0.0f;
-    x->sat = 0.0f;
-    x->value = 0.0f;
     
+    x->sat = 0.0f;      //used to control cutoff of 2-pole LP filt.
+    x->value = 0.0f;    //used to control amplitude of voice
+    
+    /*--------------2-pole filter stuff-----------------------------------------*/
+    x->cutoff = 0.0f;   //2*sin(pi*f/fs) where f is controlled by saturation
+        // saturation range 0-1 gets multiplied by 256 (arbitrary)
+    x->filt_q = 16.0f;   //setting this to something fixed.
+        //r = 1/filt_q (resonance of LP filter)
+    x->v0 = 0.0f;       //storage for 2-pole filter (value 0)
+    x->v1 = 0.0f;       //storage for 2-pole filter (value 1)
+    x->temp = 0.0f;     //storage for 2-pole filter
+    /*--------------2-pole filter stuff-----------------------------------------*/
+
     twopi = 8.0f * atanf(1.0f);
     size = (float)WAVETABLESIZE;
     
@@ -301,6 +366,17 @@ static void *pool_vox_new(t_floatarg f, t_floatarg g)
                 *(x->wavetable+i) += 1.0f/5.0f * sinf(twopi * 5.0f *(float)i/size);
                 *(x->wavetable+i) += 1.0f/7.0f * sinf(twopi * 7.0f *(float)i/size);
                 *(x->wavetable+i) += 1.0f/9.0f * sinf(twopi * 9.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/11.0f * sinf(twopi * 11.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/13.0f * sinf(twopi * 13.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/15.0f * sinf(twopi * 15.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/17.0f * sinf(twopi * 17.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/19.0f * sinf(twopi * 19.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/21.0f * sinf(twopi * 21.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/23.0f * sinf(twopi * 23.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/25.0f * sinf(twopi * 25.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/27.0f * sinf(twopi * 27.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/29.0f * sinf(twopi * 29.0f *(float)i/size);
+                *(x->wavetable+i) += 1.0f/31.0f * sinf(twopi * 31.0f *(float)i/size);
 //            }
         }
         return (x);
@@ -325,8 +401,6 @@ static void *pool_vox_new(t_floatarg f, t_floatarg g)
         outlet_free(x->x_out11);    outlet_free(x->x_out12);
         outlet_free(x->x_out13);    outlet_free(x->x_out14);
         outlet_free(x->x_out15);    outlet_free(x->x_out16);
-        
-        
     }
     
     /* this routine, which must have exactly this name (with the "~" replaced
@@ -353,6 +427,7 @@ static void *pool_vox_new(t_floatarg f, t_floatarg g)
         class_addmethod(pool_vox_class, //specify class to add method to
                         (t_method)pool_vox_dsp, //cast to pd t_method
                         gensym("dsp"), //ID for dsp objects
+                        A_CANT,//prevent crashes
                         0); //termination
         
         /* this is magic to declare that the leftmost, "main" inlet
